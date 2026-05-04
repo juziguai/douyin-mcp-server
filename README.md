@@ -41,6 +41,48 @@ douyin-mcp-server/
 └── videos/                # 下载目录 + history.db
 ```
 
+### 数据流
+
+```mermaid
+flowchart TD
+    A[用户: 抖音分享链接] --> B[parse_douyin_video]
+    B --> C{短链重定向}
+    C --> D[提取 video_id]
+    D --> E[请求分享页]
+    E --> F[括号计数法提取 _ROUTER_DATA JSON]
+    F --> G[解析视频元数据]
+    G --> H{指定 ratio?}
+
+    H -->|否| I[并行探测 8 个比率]
+    I --> J[HEAD 请求获取文件大小]
+    J --> K[按字节大小去重]
+    K --> L[返回 available_qualities]
+
+    H -->|是| M[构造带 ratio 的 CDN URL]
+    M --> N[指数退避重试解析]
+    N --> O[返回 download_link]
+
+    B --> P[download_video]
+    P --> Q{历史记录中有?}
+    Q -->|是| R[直接返回已有路径]
+    Q -->|否| S{本地文件存在?}
+    S -->|是| T[记录历史并返回]
+    S -->|否| U[流式下载 + 断点续传]
+    U --> V[记录到 SQLite]
+    V --> W[返回文件路径]
+
+    B --> X[download_cover]
+    X --> Y[下载封面图]
+
+    B --> Z[extract_audio]
+    Z --> AA[下载视频]
+    AA --> AB[ffmpeg 提取音频]
+
+    B --> AC[parse_user_videos]
+    AC --> AD[请求用户主页]
+    AD --> AE[提取视频列表]
+```
+
 ### 关键设计
 
 - **自适应清晰度**：并行探测 8 个比率（240p~4k），按文件大小精确去重
