@@ -6,18 +6,20 @@ import logging
 import os
 import re
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
+from cachetools import TTLCache
 
 from constants import HEADERS, MAX_RETRIES, REQUEST_TIMEOUT
 
 logger = logging.getLogger(__name__)
 
-_SHARE_PAGE_RE = re.compile(r"_ROUTER_DATA\s*=\s*(\{.*?\})\s*</script>", re.DOTALL)
-_SHORT_URL_RE = re.compile(r"https://v\.douyin\.com/(\w+)")
+_SHARE_PAGE_SCRIPT_RE = re.compile(r"_ROUTER_DATA\s*=\s*", re.DOTALL)
+_SHORT_URL_RE = re.compile(r"https://v\.douyin\.com/([a-zA-Z0-9]{6,12})")
 _VIDEO_ID_RE = re.compile(r"video/(\d+)")
-_DOUYIN_URL_RE = re.compile(r"https?://v\.douyin\.com/\w+")
+_DOUYIN_URL_RE = re.compile(r"https?://v\.douyin\.com/[a-zA-Z0-9]{6,12}")
 _RATIO_RE = re.compile(r"ratio=[^&]*")
 
 # Ratios to probe for availability
@@ -26,6 +28,46 @@ _PROBE_RATIOS = ["240p", "360p", "480p", "540p", "720p", "1080p", "1440p", "4k"]
 # Module-level session for TCP connection reuse
 _session = requests.Session()
 _session.headers.update(HEADERS)
+
+# TTL cache: 30 min expiry, max 128 entries
+_video_info_cache = TTLCache(maxsize=128, ttl=1800)
+_quality_cache = TTLCache(maxsize=128, ttl=1800)
+
+
+def _extract_json_from_script(html: str) -> dict | None:
+    """Extract _ROUTER_DATA JSON from HTML using bracket counting."""
+    m = _SHARE_PAGE_SCRIPT_RE.search(html)
+    if not m:
+        return None
+    start = m.end()
+    if start >= len(html) or html[start] != '{':
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(html)):
+        c = html[i]
+        if escape:
+            escape = False
+            continue
+        if c == '\\' and in_string:
+            escape = True
+            continue
+        if c == '"' and not escape:
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(html[start:i + 1])
+                except json.JSONDecodeError:
+                    return None
+    return None
 
 
 def _validate_share_url(share_url: str) -> str | None:
@@ -39,6 +81,11 @@ def _resolve_cdn_link(url: str) -> str | None:
     for i in range(MAX_RETRIES):
         try:
             resp = _session.get(url, allow_redirects=False, timeout=REQUEST_TIMEOUT)
+            if resp.status_code == 429:
+                wait = 5 * (2 ** i)
+                logger.warning("429 Too Many Requests, 等待 %.1f 秒", wait)
+                time.sleep(wait)
+                continue
             location = resp.headers.get("location", "")
             if location and "douyinvod.com" in location:
                 return location
@@ -64,13 +111,13 @@ def _probe_ratio(base_url: str, ratio: str) -> dict | None:
         size_str = head.headers.get("Content-Length")
         if not size_str or int(size_str) == 0:
             return None
-        size_mb = round(int(size_str) / (1024 * 1024), 2)
-        return {"ratio": ratio, "size_mb": size_mb, "cdn_url": cdn_url}
+        size_bytes = int(size_str)
+        return {"ratio": ratio, "size_bytes": size_bytes, "size_mb": round(size_bytes / (1024 * 1024), 2), "cdn_url": cdn_url}
     except (requests.RequestException, ValueError):
         return None
 
 
-def _probe_qualities(base_url: str) -> list[dict]:
+def _probe_qualities_impl(base_url: str) -> list[dict]:
     """Probe all ratios in parallel, deduplicate, return real available qualities."""
     with ThreadPoolExecutor(max_workers=4) as pool:
         futures = {pool.submit(_probe_ratio, base_url, r): r for r in _PROBE_RATIOS}
@@ -83,17 +130,15 @@ def _probe_qualities(base_url: str) -> list[dict]:
     if not raw:
         return []
 
-    # Group by file size to detect original-stream fallback
-    from collections import Counter
-    size_counts = Counter(r["size_mb"] for r in raw)
-    fallback_size = size_counts.most_common(1)[0][0]  # most common size = fallback
+    # Group by exact byte size to detect original-stream fallback
+    size_counts = Counter(r["size_bytes"] for r in raw)
+    fallback_size = size_counts.most_common(1)[0][0]
 
     # Separate: actual transcodes vs original fallback
     order = {r: i for i, r in enumerate(_PROBE_RATIOS)}
-    transcodes = [r for r in raw if r["size_mb"] != fallback_size]
-    fallbacks = [r for r in raw if r["size_mb"] == fallback_size]
+    transcodes = [r for r in raw if r["size_bytes"] != fallback_size]
+    fallbacks = [r for r in raw if r["size_bytes"] == fallback_size]
 
-    # For fallback group, label as "original" with the largest CDN URL
     if fallbacks:
         fallbacks.sort(key=lambda x: order.get(x["ratio"], 99))
         orig = fallbacks[-1]
@@ -106,55 +151,22 @@ def _probe_qualities(base_url: str) -> list[dict]:
     return result
 
 
-@functools.lru_cache(maxsize=128)
 def _probe_qualities(base_url: str) -> list[dict]:
-    """Probe all ratios in parallel, deduplicate, return real available qualities. Cached."""
-    return _probe_qualities_uncached(base_url)
-
-
-# Cache for quality probe results, keyed by base_url
-_quality_cache: dict[str, list[dict]] = {}
-
-
-def _probe_qualities_uncached(base_url: str) -> list[dict]:
-    """Probe all ratios in parallel, deduplicate, return real available qualities."""
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = {pool.submit(_probe_ratio, base_url, r): r for r in _PROBE_RATIOS}
-        raw = []
-        for f in futures:
-            r = f.result()
-            if r:
-                raw.append(r)
-
-    if not raw:
-        return []
-
-    # Group by file size to detect original-stream fallback
-    from collections import Counter
-    size_counts = Counter(r["size_mb"] for r in raw)
-    fallback_size = size_counts.most_common(1)[0][0]  # most common size = fallback
-
-    # Separate: actual transcodes vs original fallback
-    order = {r: i for i, r in enumerate(_PROBE_RATIOS)}
-    transcodes = [r for r in raw if r["size_mb"] != fallback_size]
-    fallbacks = [r for r in raw if r["size_mb"] == fallback_size]
-
-    # For fallback group, label as "original" with the largest CDN URL
-    if fallbacks:
-        fallbacks.sort(key=lambda x: order.get(x["ratio"], 99))
-        orig = fallbacks[-1]
-        orig["ratio"] = "original"
-        result = transcodes + [orig]
-    else:
-        result = transcodes
-
-    result.sort(key=lambda x: 999 if x["ratio"] == "original" else order.get(x["ratio"], 99))
+    """Cached wrapper for _probe_qualities_impl."""
+    cached = _quality_cache.get(base_url)
+    if cached is not None:
+        return cached
+    result = _probe_qualities_impl(base_url)
+    _quality_cache[base_url] = result
     return result
 
 
-@functools.lru_cache(maxsize=128)
 def _fetch_video_info(share_url: str) -> dict:
-    """Fetch video metadata from share page. Cached internally."""
+    """Fetch video metadata from share page. Cached with TTL."""
+    cached = _video_info_cache.get(share_url)
+    if cached is not None:
+        return cached
+
     try:
         err = _validate_share_url(share_url)
         if err:
@@ -177,11 +189,9 @@ def _fetch_video_info(share_url: str) -> dict:
         if page_resp.status_code != 200:
             return {"error": f"分享页请求失败，状态码: {page_resp.status_code}"}
 
-        match = _SHARE_PAGE_RE.search(page_resp.text)
-        if not match:
+        router_data = _extract_json_from_script(page_resp.text)
+        if not router_data:
             return {"error": "无法从分享页提取视频数据（_ROUTER_DATA 未找到）"}
-
-        router_data = json.loads(match.group(1))
 
         try:
             item_list = router_data["loaderData"]["video_(id)/page"]["videoInfoRes"]["item_list"]
@@ -199,7 +209,7 @@ def _fetch_video_info(share_url: str) -> dict:
         play_url = play_urls[0]
         no_wm_url = play_url.replace("playwm", "play")
 
-        return {
+        result = {
             "video_title": item.get("desc", ""),
             "video_id": play_addr.get("uri", ""),
             "nickname": item.get("author", {}).get("nickname", ""),
@@ -210,6 +220,8 @@ def _fetch_video_info(share_url: str) -> dict:
             "duration_ms": video.get("duration"),
             "watermark_free_url": no_wm_url,
         }
+        _video_info_cache[share_url] = result
+        return result
 
     except requests.RequestException as e:
         return {"error": f"网络请求失败: {e}"}
@@ -217,7 +229,7 @@ def _fetch_video_info(share_url: str) -> dict:
         return {"error": f"解析数据失败: {e}"}
 
 
-def parse_douyin_video(share_url: str, ratio: str = None) -> dict:
+def parse_douyin_video(share_url: str, ratio: str | None = None) -> dict:
     """Parse a Douyin share URL and return video metadata.
 
     Args:
@@ -237,14 +249,12 @@ def parse_douyin_video(share_url: str, ratio: str = None) -> dict:
 
     if ratio:
         if ratio == "original":
-            # Use probed CDN URL for original quality
             qualities = _probe_qualities(base_url)
             orig = next((q for q in qualities if q["ratio"] == "original"), None)
             if not orig:
                 return {**info, "error": "未找到原始画质"}
             return {**info, "download_link": orig["cdn_url"], "ratio": "original", "size_mb": orig["size_mb"]}
         else:
-            # Resolve specific quality
             target_url = _RATIO_RE.sub(f"ratio={ratio}", base_url)
             download_link = _resolve_cdn_link(target_url)
             result = {**info, "download_link": download_link, "ratio": ratio}
@@ -258,7 +268,6 @@ def parse_douyin_video(share_url: str, ratio: str = None) -> dict:
                     pass
             return result
     else:
-        # Probe all available qualities
         qualities = _probe_qualities(base_url)
         best = qualities[-1] if qualities else None
         result = {
@@ -266,7 +275,6 @@ def parse_douyin_video(share_url: str, ratio: str = None) -> dict:
             "available_qualities": qualities,
             "recommended_ratio": best["ratio"] if best else None,
         }
-        # Include download link for recommended quality
         if best:
             result["download_link"] = best["cdn_url"]
             result["ratio"] = best["ratio"]
@@ -275,11 +283,33 @@ def parse_douyin_video(share_url: str, ratio: str = None) -> dict:
 
 
 def download_video_file(cdn_url: str, save_path: str) -> dict:
-    """Download a video file from CDN URL to local path."""
+    """Download a video file from CDN URL to local path, with resume support."""
+    existing_size = 0
+    if os.path.exists(save_path):
+        existing_size = os.path.getsize(save_path)
+
+    headers = dict(HEADERS)
+    if existing_size > 0:
+        headers["Range"] = f"bytes={existing_size}-"
+
     try:
-        resp = _session.get(cdn_url, stream=True, timeout=60)
-        resp.raise_for_status()
-        with open(save_path, "wb") as f:
+        resp = _session.get(cdn_url, stream=True, timeout=60, headers=headers)
+
+        # If server doesn't support Range or returns full content, start fresh
+        if resp.status_code == 200:
+            existing_size = 0
+            mode = "wb"
+        elif resp.status_code == 206:
+            mode = "ab"
+        elif resp.status_code == 416:
+            # Range not satisfiable — file already complete
+            size_mb = round(existing_size / (1024 * 1024), 2)
+            return {"path": save_path, "size_mb": size_mb}
+        else:
+            resp.raise_for_status()
+            mode = "wb"
+
+        with open(save_path, mode) as f:
             for chunk in resp.iter_content(chunk_size=8192):
                 f.write(chunk)
         size_mb = round(os.path.getsize(save_path) / (1024 * 1024), 2)

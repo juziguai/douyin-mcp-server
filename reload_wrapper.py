@@ -15,6 +15,7 @@ _SERVER = os.path.join(_DIR, "server.py")
 class _Reloader(FileSystemEventHandler):
     def __init__(self):
         self._proc = None
+        self._last_trigger = 0.0
         self._start()
 
     def _start(self):
@@ -25,9 +26,14 @@ class _Reloader(FileSystemEventHandler):
         print(f"[reload] server started (pid={self._proc.pid})", file=sys.stderr)
 
     def on_modified(self, event):
-        if event.src_path.endswith(".py"):
-            print(f"[reload] change detected: {event.src_path}", file=sys.stderr)
-            self._start()
+        if not event.src_path.endswith(".py"):
+            return
+        now = time.time()
+        if now - self._last_trigger < 1.0:
+            return
+        self._last_trigger = now
+        print(f"[reload] change detected: {event.src_path}", file=sys.stderr)
+        self._start()
 
     def stop(self):
         if self._proc and self._proc.poll() is None:

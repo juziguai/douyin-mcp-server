@@ -7,7 +7,9 @@
 | MCP 工具 | 说明 |
 |----------|------|
 | `parse_douyin_video` | 解析抖音分享链接，返回视频标题、作者、封面、无水印下载地址等 |
-| `extract_download_link` | 从无水印 URL 提取最终 CDN 下载链接 |
+| `parse_batch` | 批量解析多个抖音链接 |
+| `download_video` | 解析并下载视频到本地 |
+| `download_batch` | 批量下载多个视频 |
 
 ## 安装
 
@@ -16,10 +18,16 @@ cd D:\Tools\AI\Claude-code\douyin-mcp-server
 pip install -r requirements.txt
 ```
 
+开发环境（含自动重载）：
+
+```bash
+pip install -r requirements-dev.txt
+```
+
 ## 配置 Claude Code
 
 ```bash
-claude mcp add --transport stdio --scope user douyin-video -- python D:\Tools\AI\Claude-code\douyin-mcp-server\server.py
+claude mcp add --transport stdio --scope user douyin-video -- python D:\Tools\AI\Claude-code\douyin-mcp-server\reload_wrapper.py
 ```
 
 ## 直接运行
