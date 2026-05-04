@@ -282,6 +282,103 @@ def parse_douyin_video(share_url: str, ratio: str | None = None) -> dict:
         return result
 
 
+def download_cover_file(cover_url: str, save_path: str) -> dict:
+    """Download a cover image from URL to local path."""
+    try:
+        resp = _session.get(cover_url, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        with open(save_path, "wb") as f:
+            f.write(resp.content)
+        size_kb = round(os.path.getsize(save_path) / 1024, 1)
+        return {"path": save_path, "size_kb": size_kb}
+    except requests.RequestException as e:
+        return {"error": f"封面下载失败: {e}"}
+    except OSError as e:
+        return {"error": f"文件写入失败: {e}"}
+
+
+def extract_audio_file(video_path: str, output_path: str) -> dict:
+    """Extract audio from a video file using ffmpeg."""
+    import subprocess
+    if not os.path.exists(video_path):
+        return {"error": f"视频文件不存在: {video_path}"}
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-i", video_path, "-vn", "-acodec", "libmp3lame", "-q:a", "2", "-y", output_path],
+            capture_output=True, timeout=120,
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.decode(errors="replace")
+            if "ffmpeg" in stderr and "not found" in stderr:
+                return {"error": "未安装 ffmpeg，请先安装: https://ffmpeg.org/download.html"}
+            return {"error": f"音频提取失败: {stderr[:200]}"}
+        size_mb = round(os.path.getsize(output_path) / (1024 * 1024), 2)
+        return {"path": output_path, "size_mb": size_mb}
+    except FileNotFoundError:
+        return {"error": "未安装 ffmpeg，请先安装: https://ffmpeg.org/download.html"}
+    except subprocess.TimeoutExpired:
+        return {"error": "音频提取超时（120 秒）"}
+
+
+def fetch_user_videos(user_url: str, max_count: int = 20) -> dict:
+    """Fetch video list from a Douyin user profile page."""
+    try:
+        # Extract user ID from URL
+        user_id_match = re.search(r"user/(\d+)", user_url)
+        if not user_id_match:
+            # Try short URL redirect
+            resp = _session.get(user_url, allow_redirects=False, timeout=REQUEST_TIMEOUT)
+            location = resp.headers.get("location", "")
+            user_id_match = re.search(r"user/(\d+)", location)
+            if not user_id_match:
+                return {"error": "无法从链接中提取用户 ID"}
+
+        user_id = user_id_match.group(1)
+        page_url = f"https://www.iesdouyin.com/share/user/{user_id}"
+        page_resp = _session.get(page_url, timeout=REQUEST_TIMEOUT)
+        if page_resp.status_code != 200:
+            return {"error": f"用户主页请求失败，状态码: {page_resp.status_code}"}
+
+        router_data = _extract_json_from_script(page_resp.text)
+        if not router_data:
+            return {"error": "无法从用户主页提取数据（_ROUTER_DATA 未找到）"}
+
+        try:
+            user_info = router_data["loaderData"]["user_(id)/page"]["userInfoRes"]["user_info"]
+            post_list = router_data["loaderData"]["user_(id)/page"].get("post", {}).get("data", [])
+        except (KeyError, TypeError):
+            return {"error": "无法解析用户数据结构"}
+
+        videos = []
+        for item in post_list[:max_count]:
+            video = item.get("video", {})
+            play_addr = video.get("play_addr", {})
+            play_urls = play_addr.get("url_list", [])
+            videos.append({
+                "video_id": play_addr.get("uri", ""),
+                "video_title": item.get("desc", ""),
+                "cover_url": video.get("cover", {}).get("url_list", [None])[0],
+                "width": video.get("width"),
+                "height": video.get("height"),
+                "duration_ms": video.get("duration"),
+                "share_url": f"https://v.douyin.com/{item.get('aweme_id', '')}" if item.get("aweme_id") else None,
+            })
+
+        return {
+            "nickname": user_info.get("nickname", ""),
+            "avatar_url": user_info.get("avatar_larger", {}).get("url_list", [None])[0],
+            "signature": user_info.get("signature", ""),
+            "user_id": user_id,
+            "video_count": len(videos),
+            "videos": videos,
+        }
+
+    except requests.RequestException as e:
+        return {"error": f"网络请求失败: {e}"}
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        return {"error": f"解析数据失败: {e}"}
+
+
 def download_video_file(cdn_url: str, save_path: str) -> dict:
     """Download a video file from CDN URL to local path, with resume support."""
     existing_size = 0

@@ -16,6 +16,7 @@ logging.basicConfig(
 from mcp.server.fastmcp import FastMCP
 
 import douyin_parser as parser
+import history
 
 mcp = FastMCP("douyin-video")
 
@@ -106,9 +107,23 @@ def download_video(share_url: str, filename: str | None = None, save_dir: str | 
     name = filename or _sanitize_filename(result.get("video_title", "video"))
     save_path = os.path.join(real_save_dir, f"{name}.mp4")
 
-    # Skip download if file already exists
+    # Skip download if file already exists on disk or in history
+    video_id = result.get("video_id", "")
+    existing = history.is_downloaded(video_id, "video") if video_id else None
+    if existing and os.path.exists(existing["file_path"]):
+        return {
+            "path": existing["file_path"],
+            "size_mb": existing["size_mb"],
+            "video_title": existing["video_title"],
+            "nickname": existing["nickname"],
+            "ratio": existing["ratio"],
+            "cached": True,
+        }
+
     if os.path.exists(save_path) and os.path.getsize(save_path) > 0:
         size_mb = round(os.path.getsize(save_path) / (1024 * 1024), 2)
+        history.record_download(video_id, result.get("video_title", ""), result.get("nickname", ""),
+                                share_url, save_path, "video", size_mb, result.get("ratio", ""))
         return {
             "path": save_path,
             "size_mb": size_mb,
@@ -121,6 +136,9 @@ def download_video(share_url: str, filename: str | None = None, save_dir: str | 
     dl_result = parser.download_video_file(result["download_link"], save_path)
     if "error" in dl_result:
         return dl_result
+
+    history.record_download(video_id, result.get("video_title", ""), result.get("nickname", ""),
+                            share_url, dl_result["path"], "video", dl_result["size_mb"], result.get("ratio", ""))
 
     return {
         "path": dl_result["path"],
@@ -145,6 +163,122 @@ def download_batch(share_urls: list[str], save_dir: str | None = None, ratio: st
     """
     with ThreadPoolExecutor(max_workers=4) as pool:
         return list(pool.map(lambda url: download_video(url, save_dir=save_dir, ratio=ratio), share_urls))
+
+
+@mcp.tool()
+def download_cover(share_url: str, save_dir: str | None = None, filename: str | None = None) -> dict:
+    """Download the cover image of a Douyin video.
+
+    Args:
+        share_url: A Douyin share URL, e.g. "https://v.douyin.com/xxxxxx"
+        save_dir: Directory to save the cover. If None, uses the default videos/ directory.
+        filename: Custom filename (without extension). If None, uses video title.
+
+    Returns:
+        A dict with "path", "size_kb", "video_title" on success, or "error" on failure.
+    """
+    result = parser.parse_douyin_video(share_url)
+    if "error" in result:
+        return result
+
+    cover_url = result.get("cover_url")
+    if not cover_url:
+        return {"error": "该视频没有封面图"}
+
+    save_dir = save_dir or _DEFAULT_SAVE_DIR
+    _ensure_dir(save_dir)
+
+    name = filename or _sanitize_filename(result.get("video_title", "cover"))
+    save_path = os.path.join(save_dir, f"{name}.jpg")
+
+    dl_result = parser.download_cover_file(cover_url, save_path)
+    if "error" in dl_result:
+        return dl_result
+
+    video_id = result.get("video_id", "")
+    history.record_download(video_id, result.get("video_title", ""), result.get("nickname", ""),
+                            share_url, dl_result["path"], "cover", dl_result["size_kb"] / 1024)
+
+    return {
+        "path": dl_result["path"],
+        "size_kb": dl_result["size_kb"],
+        "video_title": result.get("video_title", ""),
+    }
+
+
+@mcp.tool()
+def extract_audio(share_url: str, save_dir: str | None = None, filename: str | None = None, ratio: str | None = None) -> dict:
+    """Download a Douyin video and extract its audio as MP3.
+
+    Requires ffmpeg to be installed and available in PATH.
+
+    Args:
+        share_url: A Douyin share URL, e.g. "https://v.douyin.com/xxxxxx"
+        save_dir: Directory to save the audio. If None, uses the default videos/ directory.
+        filename: Custom filename (without extension). If None, uses video title.
+        ratio: Video quality to download before extraction. If None, uses highest available.
+
+    Returns:
+        A dict with "path", "size_mb", "video_title" on success, or "error" on failure.
+    """
+    # First download the video
+    dl = download_video(share_url, save_dir=save_dir, ratio=ratio)
+    if "error" in dl:
+        return dl
+
+    video_path = dl["path"]
+    save_dir = save_dir or _DEFAULT_SAVE_DIR
+    name = filename or _sanitize_filename(dl.get("video_title", "audio"))
+    audio_path = os.path.join(save_dir, f"{name}.mp3")
+
+    result = parser.extract_audio_file(video_path, audio_path)
+    if "error" in result:
+        return result
+
+    history.record_download("", dl.get("video_title", ""), dl.get("nickname", ""),
+                            share_url, result["path"], "audio", result["size_mb"])
+
+    return {
+        "path": result["path"],
+        "size_mb": result["size_mb"],
+        "video_title": dl.get("video_title", ""),
+    }
+
+
+@mcp.tool()
+def parse_user_videos(user_url: str, max_count: int = 20) -> dict:
+    """Fetch video list from a Douyin user profile page.
+
+    Args:
+        user_url: A Douyin user profile URL, e.g. "https://www.douyin.com/user/MS4wLjABAAAA..."
+                  or a short link that redirects to a user page.
+        max_count: Maximum number of videos to return (default 20, max 50).
+
+    Returns:
+        A dict with user info (nickname, avatar, signature) and a "videos" list.
+        Each video contains: video_id, video_title, cover_url, width, height, duration_ms, share_url.
+        On failure: {"error": "description"}
+    """
+    max_count = min(max_count, 50)
+    return parser.fetch_user_videos(user_url, max_count=max_count)
+
+
+@mcp.tool()
+def list_download_history(limit: int = 20, file_type: str | None = None, keyword: str | None = None) -> list[dict]:
+    """List download history, optionally filtered by type or keyword.
+
+    Args:
+        limit: Maximum number of records to return (default 20).
+        file_type: Filter by type: "video", "cover", or "audio". If None, returns all.
+        keyword: Search keyword in video title or nickname. If None, no filtering.
+
+    Returns:
+        A list of download records with: video_id, video_title, nickname, share_url,
+        file_path, file_type, size_mb, ratio, downloaded_at (unix timestamp).
+    """
+    if keyword:
+        return history.search_history(keyword, limit=limit)
+    return history.list_history(limit=limit, file_type=file_type)
 
 
 if __name__ == "__main__":

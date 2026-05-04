@@ -31,8 +31,12 @@ D:\Tools\AI\Claude-code\douyin-mcp-server\
 |--------|------|------|
 | `parse_douyin_video` | `share_url, ratio?` | 解析抖音链接。不指定 ratio 时自动探测所有可用清晰度；指定时返回对应 CDN 链接 |
 | `parse_batch` | `share_urls, ratio?` | 批量解析多个抖音链接 |
-| `download_video` | `share_url, filename?, save_dir?, ratio?` | 解析 + 下载视频到本地。ratio 为空时自动选最高画质 |
+| `download_video` | `share_url, filename?, save_dir?, ratio?` | 解析 + 下载视频到本地（带历史去重） |
 | `download_batch` | `share_urls, save_dir?, ratio?` | 批量下载多个视频 |
+| `download_cover` | `share_url, save_dir?, filename?` | 下载视频封面图 |
+| `extract_audio` | `share_url, save_dir?, filename?, ratio?` | 从视频提取音频为 MP3（需 ffmpeg） |
+| `parse_user_videos` | `user_url, max_count?` | 获取用户主页视频列表 |
+| `list_download_history` | `limit?, file_type?, keyword?` | 查询下载历史 |
 
 ### ratio 参数
 
@@ -149,3 +153,23 @@ watchdog>=3.0.0
 ## 源项目
 
 原始 Flask 项目位于 `D:\Tools\AI\Claude-code\flask_watermark_mvc`，本项目从中重构而来，去除了 Flask/MySQL/模板等依赖。
+
+## 功能拓展路线图
+
+### 已规划
+
+| 功能 | 工具名 | 说明 | 优先级 | 状态 |
+|------|--------|------|--------|------|
+| 封面下载 | `download_cover` | 单独下载视频封面图 | P0 | ✅ 已完成 |
+| 音频提取 | `extract_audio` | 从视频中分离音频（需 ffmpeg） | P0 | ✅ 已完成 |
+| 用户主页解析 | `parse_user_videos` | 输入用户主页链接，批量获取该用户所有视频 | P1 | ✅ 已完成 |
+| 下载历史记录 | `list_download_history` | SQLite 记录已下载视频，支持去重和查询 | P1 | ✅ 已完成 |
+
+### 待评估
+
+| 功能 | 说明 | 难度 |
+|------|------|------|
+| 视频评论抓取 | 获取视频的热门评论内容 | 中 |
+| 视频搜索 | 按关键词搜索抖音视频（需登录态） | 高 |
+| 直播流录制 | 抓取直播间 m3u8 流并录制 | 高 |
+| 字幕提取 | 提取视频中的自动字幕（如有） | 中 |
