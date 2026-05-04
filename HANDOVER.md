@@ -77,6 +77,7 @@ claude mcp list
 
 > **自动重载**：通过 `reload_wrapper.py` + `watchdog` 监听 `.py` 文件变化，代码修改后 MCP 进程自动重启，无需手动操作。
 > **注意**：首次配置后需要重启 Claude Code 会话，`reload_wrapper.py` 才会生效。
+> **限制**：自动重载仅对已有工具的代码修改生效（bug 修复、逻辑优化）。**新增工具需要重启 Claude Code 会话**，因为 MCP 客户端在启动时缓存工具列表，运行中不会重新发现。
 
 ## 依赖
 

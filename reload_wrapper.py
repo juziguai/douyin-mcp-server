@@ -1,5 +1,6 @@
 """Auto-reload wrapper for MCP server — restarts on .py file changes."""
 
+import json
 import os
 import subprocess
 import sys
@@ -12,18 +13,30 @@ _DIR = os.path.dirname(os.path.abspath(__file__))
 _SERVER = os.path.join(_DIR, "server.py")
 
 
+def _notify_tools_changed():
+    """Send MCP tools/list_changed notification to client via stdout."""
+    notification = json.dumps({
+        "jsonrpc": "2.0",
+        "method": "notifications/tools/list_changed",
+    })
+    sys.stdout.write(notification + "\n")
+    sys.stdout.flush()
+
+
 class _Reloader(FileSystemEventHandler):
     def __init__(self):
         self._proc = None
         self._last_trigger = 0.0
         self._start()
 
-    def _start(self):
+    def _start(self, is_reload=False):
         if self._proc and self._proc.poll() is None:
             self._proc.terminate()
             self._proc.wait(timeout=5)
         self._proc = subprocess.Popen([sys.executable, _SERVER])
         print(f"[reload] server started (pid={self._proc.pid})", file=sys.stderr)
+        if is_reload:
+            _notify_tools_changed()
 
     def on_modified(self, event):
         if not event.src_path.endswith(".py"):
@@ -33,7 +46,7 @@ class _Reloader(FileSystemEventHandler):
             return
         self._last_trigger = now
         print(f"[reload] change detected: {event.src_path}", file=sys.stderr)
-        self._start()
+        self._start(is_reload=True)
 
     def stop(self):
         if self._proc and self._proc.poll() is None:
