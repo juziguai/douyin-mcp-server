@@ -46,6 +46,7 @@ def parse_douyin_video(share_url: str, ratio: str | None = None) -> dict:
 
     Args:
         share_url: A Douyin share URL, e.g. "https://v.douyin.com/xxxxxx"
+                   or a full URL like "https://www.douyin.com/video/xxx"
         ratio: Optional. If specified (e.g. "720p"), resolve download link for that quality.
                If omitted, automatically probes all available qualities and returns them
                with recommended_ratio (highest quality with valid content).
@@ -81,6 +82,7 @@ def download_video(share_url: str, filename: str | None = None, save_dir: str | 
 
     Args:
         share_url: A Douyin share URL, e.g. "https://v.douyin.com/xxxxxx"
+                   or a full URL like "https://www.douyin.com/video/xxx"
         filename: Custom filename (without extension). If None, uses video title.
         save_dir: Directory to save the video. If None, uses the default videos/ directory.
         ratio: Video quality (e.g. "720p", "1080p"). If None, uses the highest available quality.
@@ -166,6 +168,45 @@ def download_batch(share_urls: list[str], save_dir: str | None = None, ratio: st
 
 
 @mcp.tool()
+def download_user_batch(user_url: str, max_count: int = 10, save_dir: str | None = None, ratio: str | None = None) -> dict:
+    """Batch download videos from a Douyin user's profile.
+
+    Args:
+        user_url: A Douyin user profile URL, e.g. "https://www.douyin.com/user/xxx"
+                  or a short link that redirects to a user page.
+        max_count: Maximum number of videos to download (default 10, max 50).
+        save_dir: Directory to save videos. If None, uses the default videos/ directory.
+        ratio: Video quality (e.g. "720p"). If None, uses highest available per video.
+
+    Returns:
+        A dict with user info, "total" count, and "results" list (each with path/size or error).
+    """
+    max_count = min(max_count, 50)
+    user_info = parser.fetch_user_videos(user_url, max_count=max_count)
+    if "error" in user_info:
+        return user_info
+
+    videos = user_info.get("videos", [])
+    if not videos:
+        return {"error": "该用户没有视频"}
+
+    share_urls = [v["share_url"] for v in videos if v.get("share_url")]
+    if not share_urls:
+        return {"error": "无法获取视频分享链接"}
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(lambda url: download_video(url, save_dir=save_dir, ratio=ratio), share_urls))
+
+    return {
+        "nickname": user_info.get("nickname", ""),
+        "user_id": user_info.get("user_id", ""),
+        "total": len(results),
+        "success": sum(1 for r in results if "error" not in r),
+        "results": results,
+    }
+
+
+@mcp.tool()
 def download_cover(share_url: str, save_dir: str | None = None, filename: str | None = None) -> dict:
     """Download the cover image of a Douyin video.
 
@@ -186,10 +227,15 @@ def download_cover(share_url: str, save_dir: str | None = None, filename: str | 
         return {"error": "该视频没有封面图"}
 
     save_dir = save_dir or _DEFAULT_SAVE_DIR
-    _ensure_dir(save_dir)
+    real_save_dir = os.path.realpath(save_dir)
+    real_default = os.path.realpath(_DEFAULT_SAVE_DIR)
+    if not real_save_dir.startswith(real_default) and not os.path.isabs(save_dir):
+        save_dir = _DEFAULT_SAVE_DIR
+        real_save_dir = real_default
+    _ensure_dir(real_save_dir)
 
     name = filename or _sanitize_filename(result.get("video_title", "cover"))
-    save_path = os.path.join(save_dir, f"{name}.jpg")
+    save_path = os.path.join(real_save_dir, f"{name}.jpg")
 
     dl_result = parser.download_cover_file(cover_url, save_path)
     if "error" in dl_result:
@@ -264,6 +310,24 @@ def parse_user_videos(user_url: str, max_count: int = 20) -> dict:
 
 
 @mcp.tool()
+def get_video_comments(share_url: str, max_count: int = 20) -> dict:
+    """Fetch top comments for a Douyin video.
+
+    Args:
+        share_url: A Douyin share URL, e.g. "https://v.douyin.com/xxxxxx"
+                   or a full URL like "https://www.douyin.com/video/xxx"
+        max_count: Maximum number of comments to return (default 20, max 50).
+
+    Returns:
+        A dict with video_title, comment_count, and a "comments" list.
+        Each comment: text, nickname, digg_count, reply_count, create_time.
+        On failure: {"error": "description"}
+    """
+    max_count = min(max_count, 50)
+    return parser.fetch_video_comments(share_url, max_count=max_count)
+
+
+@mcp.tool()
 def list_download_history(limit: int = 20, file_type: str | None = None, keyword: str | None = None) -> list[dict]:
     """List download history, optionally filtered by type or keyword.
 
@@ -279,6 +343,43 @@ def list_download_history(limit: int = 20, file_type: str | None = None, keyword
     if keyword:
         return history.search_history(keyword, limit=limit)
     return history.list_history(limit=limit, file_type=file_type)
+
+
+@mcp.tool()
+def delete_history(record_id: int | None = None, file_type: str | None = None, delete_file: bool = False) -> dict:
+    """Delete download history records.
+
+    Args:
+        record_id: Delete a specific record by ID. If specified, file_type is ignored.
+        file_type: Delete all records of this type ("video", "cover", "audio"). If None and record_id is None, clears all.
+        delete_file: If True, also delete the local file. Default False (only removes DB record).
+
+    Returns:
+        A dict with "deleted" count or "error" on failure.
+    """
+    if record_id is not None:
+        record = history.delete_record(record_id)
+        if not record:
+            return {"error": f"记录 ID {record_id} 不存在"}
+        deleted = 1
+        if delete_file and record.get("file_path") and os.path.exists(record["file_path"]):
+            try:
+                os.remove(record["file_path"])
+            except OSError:
+                pass
+    else:
+        # Get records first if we need to delete files
+        if delete_file:
+            records = history.list_history(limit=9999, file_type=file_type)
+            for r in records:
+                if r.get("file_path") and os.path.exists(r["file_path"]):
+                    try:
+                        os.remove(r["file_path"])
+                    except OSError:
+                        pass
+        deleted = history.clear_history(file_type=file_type)
+
+    return {"deleted": deleted}
 
 
 if __name__ == "__main__":

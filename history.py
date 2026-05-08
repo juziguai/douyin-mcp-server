@@ -95,3 +95,25 @@ def search_history(keyword: str, limit: int = 20) -> list[dict]:
             (pattern, pattern, limit),
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+def delete_record(record_id: int) -> dict:
+    """Delete a single download record by ID. Returns the deleted record or None."""
+    init_db()
+    with _conn() as c:
+        row = c.execute("SELECT * FROM downloads WHERE id = ?", (record_id,)).fetchone()
+        if not row:
+            return None
+        c.execute("DELETE FROM downloads WHERE id = ?", (record_id,))
+        return dict(row)
+
+
+def clear_history(file_type: str | None = None) -> int:
+    """Clear download history. Returns number of deleted records."""
+    init_db()
+    with _conn() as c:
+        if file_type:
+            cur = c.execute("DELETE FROM downloads WHERE file_type = ?", (file_type,))
+        else:
+            cur = c.execute("DELETE FROM downloads")
+        return cur.rowcount

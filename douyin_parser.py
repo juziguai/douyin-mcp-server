@@ -20,6 +20,7 @@ _SHARE_PAGE_SCRIPT_RE = re.compile(r"_ROUTER_DATA\s*=\s*", re.DOTALL)
 _SHORT_URL_RE = re.compile(r"https://v\.douyin\.com/([a-zA-Z0-9]{6,12})")
 _VIDEO_ID_RE = re.compile(r"video/(\d+)")
 _DOUYIN_URL_RE = re.compile(r"https?://v\.douyin\.com/[a-zA-Z0-9]{6,12}")
+_DOUYIN_FULL_URL_RE = re.compile(r"https?://www\.douyin\.com/video/(\d+)")
 _RATIO_RE = re.compile(r"ratio=[^&]*")
 
 # Ratios to probe for availability
@@ -71,9 +72,12 @@ def _extract_json_from_script(html: str) -> dict | None:
 
 
 def _validate_share_url(share_url: str) -> str | None:
-    if not share_url or not _DOUYIN_URL_RE.match(share_url.strip()):
-        return "无效的抖音链接，需要 https://v.douyin.com/xxx 格式"
-    return None
+    url = share_url.strip() if share_url else ""
+    if not url:
+        return "链接不能为空"
+    if _DOUYIN_URL_RE.match(url) or _DOUYIN_FULL_URL_RE.match(url):
+        return None
+    return "无效的抖音链接，需要 https://v.douyin.com/xxx 或 https://www.douyin.com/video/xxx 格式"
 
 
 def _resolve_cdn_link(url: str) -> str | None:
@@ -172,17 +176,22 @@ def _fetch_video_info(share_url: str) -> dict:
         if err:
             return {"error": err}
 
-        match = _SHORT_URL_RE.findall(share_url)
-        if not match:
-            return {"error": "无法从链接中提取抖音短链，请检查 URL 格式"}
-        min_url = "https://v.douyin.com/" + match[0]
+        # Support full URL: https://www.douyin.com/video/xxx
+        full_match = _DOUYIN_FULL_URL_RE.search(share_url)
+        if full_match:
+            video_id = full_match.group(1)
+        else:
+            match = _SHORT_URL_RE.findall(share_url)
+            if not match:
+                return {"error": "无法从链接中提取抖音短链，请检查 URL 格式"}
+            min_url = "https://v.douyin.com/" + match[0]
 
-        resp = _session.get(min_url, allow_redirects=False, timeout=REQUEST_TIMEOUT)
-        location = resp.headers.get("location", "")
-        video_ids = _VIDEO_ID_RE.findall(location)
-        if not video_ids:
-            return {"error": "无法从重定向中提取视频 ID"}
-        video_id = video_ids[0]
+            resp = _session.get(min_url, allow_redirects=False, timeout=REQUEST_TIMEOUT)
+            location = resp.headers.get("location", "")
+            video_ids = _VIDEO_ID_RE.findall(location)
+            if not video_ids:
+                return {"error": "无法从重定向中提取视频 ID"}
+            video_id = video_ids[0]
 
         page_url = f"https://www.iesdouyin.com/share/video/{video_id}/"
         page_resp = _session.get(page_url, timeout=REQUEST_TIMEOUT)
@@ -361,7 +370,7 @@ def fetch_user_videos(user_url: str, max_count: int = 20) -> dict:
                 "width": video.get("width"),
                 "height": video.get("height"),
                 "duration_ms": video.get("duration"),
-                "share_url": f"https://v.douyin.com/{item.get('aweme_id', '')}" if item.get("aweme_id") else None,
+                "share_url": f"https://www.douyin.com/video/{item.get('aweme_id', '')}" if item.get("aweme_id") else None,
             })
 
         return {
@@ -377,6 +386,52 @@ def fetch_user_videos(user_url: str, max_count: int = 20) -> dict:
         return {"error": f"网络请求失败: {e}"}
     except (json.JSONDecodeError, KeyError, TypeError) as e:
         return {"error": f"解析数据失败: {e}"}
+
+
+def fetch_video_comments(share_url: str, max_count: int = 20) -> dict:
+    """Fetch top comments for a Douyin video via web API."""
+    info = _fetch_video_info(share_url)
+    if "error" in info:
+        return info
+
+    video_id = info.get("video_id", "")
+    if not video_id:
+        return {"error": "无法获取视频 ID"}
+
+    api_url = "https://www.douyin.com/aweme/v1/web/comment/list/"
+    params = {
+        "aweme_id": video_id,
+        "cursor": 0,
+        "count": min(max_count, 50),
+        "item_type": 0,
+    }
+    try:
+        resp = _session.get(api_url, params=params, timeout=REQUEST_TIMEOUT)
+        data = resp.json()
+        comment_list = data.get("comments", [])
+        if not comment_list:
+            return {"video_title": info.get("video_title", ""), "comment_count": 0, "comments": []}
+
+        comments = []
+        for c in comment_list[:max_count]:
+            user = c.get("user", {})
+            comments.append({
+                "text": c.get("text", ""),
+                "nickname": user.get("nickname", ""),
+                "digg_count": c.get("digg_count", 0),
+                "reply_count": c.get("reply_comment_total", 0),
+                "create_time": c.get("create_time", 0),
+            })
+
+        return {
+            "video_title": info.get("video_title", ""),
+            "comment_count": len(comments),
+            "comments": comments,
+        }
+    except requests.RequestException as e:
+        return {"error": f"评论请求失败: {e}"}
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        return {"error": f"评论数据解析失败: {e}"}
 
 
 def download_video_file(cdn_url: str, save_path: str) -> dict:

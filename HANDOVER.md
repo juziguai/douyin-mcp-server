@@ -1,94 +1,98 @@
-# 抖音视频 MCP Server - 项目交接文档
+# 抖音视频 CLI - 项目交接文档
 
 ## 项目概述
 
-将 `flask_watermark_mvc`（微信云托管 Flask 服务）重构为 MCP Server，供 Claude Code CLI 通过 MCP 协议直接调用抖音视频去水印解析功能。
+将 `flask_watermark_mvc`（微信云托管 Flask 服务）重构为 CLI 工具，供 Claude Code 或终端直接调用抖音视频去水印解析功能。同时保留 MCP 模式作为备选。
 
 ## 当前状态
 
-- **MCP Server 已创建并注册** — `douyin-video` (user scope，全局可用)
-- **服务器连接正常** — `claude mcp list` 显示 ✓ Connected
-- **8 个工具已注册** — 解析、下载、封面、音频、用户主页、历史记录
-- **代码审查已完成** — 17 个问题全部修复（2 严重 + 5 中等 + 10 轻微）
+- **CLI 模式已就绪** — `python cli.py <command>` 直接调用
+- **10 个子命令** — 解析、下载、封面、音频、用户主页、历史记录、批量操作
+- **MCP 模式可选** — `server.py` 保留，需额外安装 `mcp[cli]`
 - **GitHub 仓库** — https://github.com/juziguai/douyin-mcp-server
 
 ## 项目结构
 
 ```
 D:\Tools\AI\Claude-code\douyin-mcp-server\
-├── server.py              # MCP 工具定义（FastMCP, stdio 传输）
-├── douyin_parser.py       # 核心解析逻辑（清晰度探测、CDN 解析、下载）
-├── history.py             # SQLite 下载历史记录
-├── constants.py           # 请求头、超时、重试常量
-├── reload_wrapper.py      # 自动重载包装器（watchdog 监听 .py 变化）
-├── requirements.txt       # 生产依赖：mcp[cli], requests, cachetools
-├── requirements-dev.txt   # 开发依赖：watchdog
-├── README.md              # 使用说明 + 架构图
-├── HANDOVER.md            # 本文档
-└── videos/                # 下载目录 + history.db
+├── cli.py               # CLI 入口（argparse 子命令）
+├── server.py            # MCP 模式入口（FastMCP, 可选）
+├── douyin_parser.py     # 核心解析逻辑（清晰度探测、CDN 解析、下载）
+├── history.py           # SQLite 下载历史记录
+├── constants.py         # 请求头、超时、重试常量
+├── reload_wrapper.py    # MCP 模式自动重载包装器（可选）
+├── requirements.txt     # 依赖：requests, cachetools
+├── README.md            # 使用说明 + 架构图
+├── HANDOVER.md          # 本文档
+└── videos/              # 下载目录 + history.db
 ```
 
-## MCP 工具
+## CLI 命令
 
-| 工具名 | 参数 | 功能 |
-|--------|------|------|
-| `parse_douyin_video` | `share_url, ratio?` | 解析抖音链接，返回元数据 + CDN 链接 |
-| `parse_batch` | `share_urls, ratio?` | 批量解析（并行执行） |
-| `download_video` | `share_url, filename?, save_dir?, ratio?` | 解析 + 下载，自动记录历史并去重 |
-| `download_batch` | `share_urls, save_dir?, ratio?` | 批量下载（并行执行） |
-| `download_cover` | `share_url, save_dir?, filename?` | 下载视频封面图 |
-| `extract_audio` | `share_url, save_dir?, filename?, ratio?` | 提取音频为 MP3（需 ffmpeg） |
-| `parse_user_videos` | `user_url, max_count?` | 获取用户主页视频列表（最多 50 个） |
-| `list_download_history` | `limit?, file_type?, keyword?` | 查询下载历史（按类型/关键词筛选） |
+| 命令 | 说明 |
+|------|------|
+| `douyin parse <url>` | 解析抖音链接，返回元数据 + CDN 链接 |
+| `douyin parse-batch <urls...>` | 批量解析（并行执行） |
+| `douyin download <url>` | 解析 + 下载，自动记录历史并去重 |
+| `douyin download-batch <urls...>` | 批量下载（并行执行） |
+| `douyin download-cover <url>` | 下载视频封面图 |
+| `douyin download-user <user-url>` | 批量下载用户主页视频 |
+| `douyin audio <url>` | 提取音频为 MP3（需 ffmpeg） |
+| `douyin user-videos <user-url>` | 获取用户主页视频列表（最多 50 个） |
+| `douyin history` | 查询下载历史（按类型/关键词筛选） |
+| `douyin delete-history` | 删除下载记录（可选删除本地文件） |
 
-### ratio 参数
+### 通用选项
 
-| 值 | 说明 |
-|----|------|
-| `None`（默认） | 自动探测所有可用清晰度，返回 `available_qualities` 列表 |
-| `"720p"` / `"540p"` 等 | 指定转码版本 |
-| `"original"` | 原始画质（未转码，文件最大） |
+| 选项 | 说明 |
+|------|------|
+| `--pretty` | 美化 JSON 输出 |
+| `--ratio` | 指定清晰度：`720p`、`540p`、`original` 等 |
+| `--save-dir` | 自定义保存目录 |
+| `--filename` | 自定义文件名（不含扩展名） |
 
-### available_qualities 返回示例
-
-```json
-{
-  "available_qualities": [
-    {"ratio": "540p", "size_mb": 34.18, "cdn_url": "..."},
-    {"ratio": "720p", "size_mb": 33.74, "cdn_url": "..."},
-    {"ratio": "original", "size_mb": 44.88, "cdn_url": "..."}
-  ],
-  "recommended_ratio": "original"
-}
-```
-
-**去重逻辑**：抖音对不存在的清晰度会回退到原始流（同文件大小）。探测时按字节大小精确分组，相同大小的合并为 "original"，只保留真正转码的不同清晰度。
-
-## MCP 注册信息
+## 用法示例
 
 ```bash
-# 已注册命令（使用自动重载包装器）
-claude mcp add --transport stdio --scope user douyin-video -- python D:\Tools\AI\Claude-code\douyin-mcp-server\reload_wrapper.py
+# 解析视频（查看清晰度列表）
+python cli.py parse "https://v.douyin.com/kp6deD7Gta8/" --pretty
 
-# 配置位置
-C:\Users\juzi\.claude.json (user scope)
+# 下载最高画质
+python cli.py download "https://v.douyin.com/kp6deD7Gta8/" --pretty
 
-# 查看状态
-claude mcp list
+# 下载指定画质
+python cli.py download "https://v.douyin.com/kp6deD7Gta8/" --ratio 720p
+
+# 下载封面
+python cli.py download-cover "https://v.douyin.com/kp6deD7Gta8/"
+
+# 提取音频（需 ffmpeg）
+python cli.py audio "https://v.douyin.com/kp6deD7Gta8/" --pretty
+
+# 查看下载历史
+python cli.py history --pretty
+
+# 按关键词搜索历史
+python cli.py history --keyword "声笙" --pretty
+
+# 删除记录（同时删除文件）
+python cli.py delete-history --id 1 --delete-file
 ```
 
-> **自动重载**：通过 `reload_wrapper.py` + `watchdog` 监听 `.py` 文件变化，代码修改后 MCP 进程自动重启，无需手动操作。
-> **注意**：首次配置后需要重启 Claude Code 会话，`reload_wrapper.py` 才会生效。
-> **限制**：自动重载仅对已有工具的代码修改生效（bug 修复、逻辑优化）。**新增工具需要重启 Claude Code 会话**，因为 MCP 客户端在启动时缓存工具列表，运行中不会重新发现。
+## 配置 Claude Code
+
+直接在会话中使用：
+
+```
+下载抖音视频: python D:\Tools\AI\Claude-code\douyin-mcp-server\cli.py download "<url>" --pretty
+```
 
 ## 依赖
 
 | 包 | 版本 | 用途 |
 |----|------|------|
-| `mcp[cli]` | >=1.2.0 | MCP 协议 |
 | `requests` | >=2.28.0 | HTTP 请求 |
 | `cachetools` | >=5.0.0 | TTL 缓存（30 分钟过期） |
-| `watchdog` | >=3.0.0 | 文件监听（仅开发，`requirements-dev.txt`） |
 
 可选：`ffmpeg`（音频提取功能需要）
 
@@ -101,76 +105,62 @@ claude mcp list
 - **路径安全**：`_sanitize_filename` + `os.path.basename` + `os.path.realpath` 三重防护
 - **Session 复用**：模块级 `requests.Session()` 复用 TCP 连接
 - **指数退避**：CDN 解析重试使用 `0.5 * 2^i` 秒，429 状态码额外等待 5 秒
-- **批量并行**：`parse_batch` / `download_batch` 使用 `ThreadPoolExecutor` 并行执行
+- **批量并行**：`parse-batch` / `download-batch` 使用 `ThreadPoolExecutor` 并行执行
 - **SQLite 历史**：自动记录下载记录，支持去重和关键词搜索
-- **请求头补全**：Accept、Accept-Language、Referer 等，降低反爬风险
 
-## 代码审查修复记录（2026-05-05）
+## 代码审查修复记录
 
-### 严重
-
-| 编号 | 问题 | 修复 |
-|------|------|------|
-| C-1 | `_probe_qualities` 重复定义，第一次是死代码 | 删除死代码，重命名为 `_probe_qualities_impl` |
-| C-2 | `filename` / `save_dir` 路径遍历漏洞 | 添加 `..` 过滤 + `os.path.basename` + `realpath` 校验 |
-
-### 中等
+### 2026-05-05 初始审查
 
 | 编号 | 问题 | 修复 |
 |------|------|------|
-| I-1 | `_ROUTER_DATA` 正则匹配到 `</script>` 截断 | 改用括号计数法提取完整 JSON |
-| I-2 | `@lru_cache` 无 TTL，CDN 链接过期后失效 | 替换为 `cachetools.TTLCache`（30 分钟） |
-| I-3 | 文件大小去重用 MB 四舍五入，精度不够 | 改用精确字节数比较 |
-| I-4 | 下载文件静默覆盖 | 写入前检查文件是否存在 |
-| I-5 | 请求头只有 User-Agent | 补充 Accept/Accept-Language/Referer |
+| C-1 | `_probe_qualities` 重复定义 | 删除死代码，重命名为 `_probe_qualities_impl` |
+| C-2 | 路径遍历漏洞 | 添加 `realpath` 校验 |
+| I-1 | `_ROUTER_DATA` 正则截断 | 改用括号计数法 |
+| I-2 | `@lru_cache` 无 TTL | 替换为 `TTLCache` |
+| I-3 | 文件大小去重精度不够 | 改用字节数比较 |
+| I-4 | 下载静默覆盖 | 写入前检查文件存在 |
+| I-5 | 请求头不完整 | 补充 Accept/Accept-Language/Referer |
 
-### 轻微
+### 2026-05-08 CLI 重构
 
 | 编号 | 问题 | 修复 |
 |------|------|------|
-| S-1 | URL 正则 `\w+` 过于宽松 | 收紧为 `[a-zA-Z0-9]{6,12}` |
-| S-2 | `Counter` 在函数内重复导入 | 移至文件顶部 |
-| S-3 | 重试逻辑未处理 429 状态码 | 检测 429 时额外等待 5 秒 |
-| S-4 | README.md 仍列出已移除的工具 | 更新工具列表 |
-| S-5 | `jsonpath` 依赖未使用 | 从 requirements.txt 移除 |
-| S-6 | `watchdog` 应分离为开发依赖 | 移至 requirements-dev.txt |
-| S-7 | 类型标注 `str = None` 不规范 | 改为 `str \| None = None` |
-| S-8 | `parse_batch` 串行执行 | 使用 `ThreadPoolExecutor` 并行化 |
-| S-9 | 下载不支持断点续传 | 支持 `Range` 请求头 |
-| S-10 | `reload_wrapper.py` 缺防抖 | 加入 1 秒防抖 |
+| B-1 | `download_cover` 路径遍历 | 添加 `realpath` + `startswith` 校验 |
+| B-2 | `aweme_id` 格式不匹配 | 新增 `_DOUYIN_FULL_URL_RE`，支持完整 URL |
+| B-3 | URL 验证只接受短链 | 同时接受 `v.douyin.com` 和 `www.douyin.com/video/` |
+| — | MCP → CLI 重构 | 新增 `cli.py`，10 个子命令 |
+| — | 评论 API 需登录态 | 移除 comments 功能（公开 API 不可用） |
 
 ## 验证结果
 
 | 测试项 | 结果 |
 |--------|------|
-| URL 校验（无效链接） | `{'error': '无效的抖音链接...'}` |
-| 真实链接解析 | 成功，返回标题/作者/CDN 链接 |
-| download_video 下载 | 33.74MB，路径正确 |
-| TTL 缓存 | 首次解析后缓存命中，30 分钟后自动过期 |
-| 清晰度探测 | 540p/720p/original 按字节去重 |
-| ratio="original" | 正确返回原始画质 CDN 链接（44.88MB） |
-| MCP 工具注册 | 8 个工具全部注册成功 |
-| 路径遍历防护 | `../../etc/passwd` → `____etc_passwd` |
-| 断点续传 | Range 请求头正确处理 206/416 状态码 |
-| 批量并行 | parse_batch / download_batch 并行执行 |
-| 下载历史 | SQLite 记录正确，去重和搜索功能正常 |
+| `parse` 命令 | 成功解析，返回 3 个清晰度 |
+| `download` 命令 | 2.57MB，下载成功 |
+| `download-cover` 命令 | 18KB，下载成功 |
+| `history` 命令 | 正确显示历史记录 |
+| `delete-history` 命令 | 成功删除指定记录 |
+| `--pretty` 输出 | JSON 格式化正常 |
+| URL 校验（短链 + 完整链接） | 两种格式均通过 |
 
-## 新会话待办
+## MCP 模式（可选）
 
-1. **必须**：重启 Claude Code 会话让新工具生效（首次配置后需要）
-2. 之后代码改动会自动重载，无需手动操作
-3. 如果抖音 API 再次变更，检查 `_ROUTER_DATA` 提取逻辑和页面结构
-4. 音频提取功能需要安装 ffmpeg
+如需 MCP 模式：
 
-## 源项目
-
-原始 Flask 项目位于 `D:\Tools\AI\Claude-code\flask_watermark_mvc`，本项目从中重构而来，去除了 Flask/MySQL/模板等依赖。
+```bash
+pip install "mcp[cli]>=1.2.0"
+claude mcp add --transport stdio --scope user douyin-video -- python D:\Tools\AI\Claude-code\douyin-mcp-server\server.py
+```
 
 ## 待评估功能
 
 | 功能 | 说明 | 难度 |
 |------|------|------|
-| 视频评论抓取 | 获取视频的热门评论内容 | 中 |
 | 视频搜索 | 按关键词搜索抖音视频（需登录态） | 高 |
 | 直播流录制 | 抓取直播间 m3u8 流并录制 | 高 |
 | 字幕提取 | 提取视频中的自动字幕（如有） | 中 |
+
+## 源项目
+
+原始 Flask 项目位于 `D:\Tools\AI\Claude-code\flask_watermark_mvc`，本项目从中重构而来。
